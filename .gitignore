@@ -1,0 +1,113 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*.tmp
+*.temp
+*.bak
+*~
+.idea/
+.vscode/
+
+# Local env and secrets
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.jks
+*.keystore
+*.kdbx
+secrets/
+private/
+credentials/
+
+# PowerShell / logs
+*.ps1xml
+*.clixml
+*.log
+logs/
+
+# Project outputs and analysis artifacts
+apk-validator-output/
+output/
+reports/
+artifacts/
+decoded/
+decompiled/
+tmp/
+temp/
+
+# Potentially sensitive generated reports/data
+*.sarif
+*.sqlite
+*.db
+*.csv
+*.tsv
+
+# APK / Android artifacts (keep source script/docs only)
+*.apk
+*.apks
+*.aab
+*.xapk
+*.dex
+*.odex
+*.vdex
+*.so
+*.keystore
+*.idsig
+*.pk8
+*.der
+
+# Java / JVM build outputs
+*.class
+*.jar
+*.war
+*.ear
+target/
+build/
+out/
+.gradle/
+
+# Node / frontend future expansion
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+.npm/
+.yarn/
+.next/
+.nuxt/
+.svelte-kit/
+dist/
+coverage/
+
+# Python future tooling
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+
+# Terraform / cloud state (future infra)
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Git safety
+.git-credentials

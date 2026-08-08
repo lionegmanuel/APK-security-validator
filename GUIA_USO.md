@@ -87,3 +87,11 @@ Siempre revisa `topFindings` y `conclusions` en `report.json`.
 - Podes subir el script y esta guia a Git sin problema.
 - Evita subir APKs analizados y reportes sensibles si contienen IOCs o rutas privadas.
 - No subas API keys; usa variables de entorno o archivo local ignorado por Git.
+
+## 10) Ejecucion en VPS
+
+Si queres ejecutar el analizador en servidor (para no consumir RAM/CPU de tu PC), revisa:
+
+- `GUIA_VPS.md`
+
+Incluye instalacion en Ubuntu, subida de APK, ejecucion remota y descarga de reportes.

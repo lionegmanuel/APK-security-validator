@@ -6,7 +6,13 @@ param(
   [string]$VirusTotalApiKey = "",
   [switch]$EnableVirusTotal,
   [switch]$KeepArtifacts,
-  [int]$MaxStringSamplesPerRule = 25
+  [int]$MaxStringSamplesPerRule = 25,
+  [int]$ApktoolTimeoutSec = 900,
+  [int]$MaxScanFiles = 15000,
+  [int]$ProgressEveryFiles = 500,
+  [ValidateSet("balanced", "fast", "deep")]
+  [string]$Profile = "balanced",
+  [int]$ApktoolRetryHeapMb = 2048
 )
 
 Set-StrictMode -Version Latest
@@ -89,17 +95,107 @@ function Collect-Files {
 
 function Select-RuleEvidence {
   param(
-    [System.Collections.Generic.List[object]]$Matches,
+    [object[]]$Matches,
     [int]$MaxItems
   )
   $result = New-Collection
   $count = 0
   foreach ($m in $Matches) {
-    $result.Add([PSCustomObject]@{ file = $m.Path; line = $m.LineNumber; text = ($m.Line.Trim()) }) | Out-Null
+    $lineText = ""
+    if ($null -ne $m.Line) {
+      $lineText = ([string]$m.Line).Trim()
+    }
+    $filePath = ""
+    if ($null -ne $m.Path) {
+      $filePath = [string]$m.Path
+    }
+    $lineNumber = 0
+    if ($null -ne $m.LineNumber) {
+      $lineNumber = [int]$m.LineNumber
+    }
+    $result.Add([PSCustomObject]@{ file = $filePath; line = $lineNumber; text = $lineText }) | Out-Null
     $count++
     if ($count -ge $MaxItems) { break }
   }
-  return @($result)
+  return $result.ToArray()
+}
+
+function Write-Phase {
+  param([string]$Message)
+  "[phase] $Message"
+}
+
+function Invoke-NativeCapture {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments
+  )
+
+  $previousEap = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $output = & $FilePath @Arguments 2>&1
+    $exitCode = $LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $previousEap
+  }
+
+  return [PSCustomObject]@{
+    output = @($output)
+    text = (@($output) | Out-String)
+    exitCode = $exitCode
+  }
+}
+
+function Invoke-ProcessWithTimeout {
+  param(
+    [string]$FilePath,
+    [string[]]$Arguments,
+    [int]$TimeoutSec = 0
+  )
+
+  $tmpOut = Join-Path ([IO.Path]::GetTempPath()) ("apk_validator_out_" + [Guid]::NewGuid().ToString("N") + ".log")
+  $tmpErr = Join-Path ([IO.Path]::GetTempPath()) ("apk_validator_err_" + [Guid]::NewGuid().ToString("N") + ".log")
+
+  try {
+    $startArgs = @{
+      FilePath = $FilePath
+      ArgumentList = $Arguments
+      PassThru = $true
+      RedirectStandardOutput = $tmpOut
+      RedirectStandardError = $tmpErr
+    }
+    if ($IsWindows) {
+      $startArgs.WindowStyle = "Hidden"
+    }
+    $proc = Start-Process @startArgs
+
+    if ($TimeoutSec -gt 0) {
+      $finished = $proc.WaitForExit($TimeoutSec * 1000)
+      if (-not $finished) {
+        try { $proc.Kill() } catch { }
+        return [PSCustomObject]@{ output = @("Process timeout after $TimeoutSec sec"); text = "Process timeout after $TimeoutSec sec"; exitCode = -1; timedOut = $true }
+      }
+    }
+    else {
+      $proc.WaitForExit()
+    }
+
+    $lines = New-Collection
+    if (Test-Path -LiteralPath $tmpOut) {
+      foreach ($l in (Get-Content -LiteralPath $tmpOut -ErrorAction SilentlyContinue)) { $lines.Add($l) | Out-Null }
+    }
+    if (Test-Path -LiteralPath $tmpErr) {
+      foreach ($l in (Get-Content -LiteralPath $tmpErr -ErrorAction SilentlyContinue)) { $lines.Add($l) | Out-Null }
+    }
+
+    return [PSCustomObject]@{ output = $lines.ToArray(); text = ($lines -join [Environment]::NewLine); exitCode = $proc.ExitCode; timedOut = $false }
+  }
+  finally {
+    if (Test-Path -LiteralPath $tmpOut) { Remove-Item -LiteralPath $tmpOut -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $tmpErr) { Remove-Item -LiteralPath $tmpErr -Force -ErrorAction SilentlyContinue }
+  }
 }
 
 function Get-RuleMatches {
@@ -109,9 +205,50 @@ function Get-RuleMatches {
   )
 
   if ($null -eq $Paths -or $Paths.Count -eq 0) { return @() }
-  $hits = Select-String -Path $Paths -Pattern $Pattern -CaseSensitive:$false -ErrorAction SilentlyContinue
-  if ($null -eq $hits) { return @() }
-  return @($hits)
+
+  $existingPaths = @($Paths | Where-Object { Test-Path -LiteralPath $_ })
+  if ($existingPaths.Count -eq 0) { return @() }
+
+  try {
+    $hits = Select-String -LiteralPath $existingPaths -Pattern $Pattern -CaseSensitive:$false -ErrorAction SilentlyContinue
+    if ($null -eq $hits) { return @() }
+    return @($hits)
+  }
+  catch {
+    return @()
+  }
+}
+
+function Invoke-ApktoolDecode {
+  param(
+    [string]$ApktoolPath,
+    [string]$ApkPath,
+    [string]$DecodedPath
+  )
+
+  $firstRun = Invoke-ProcessWithTimeout -FilePath $ApktoolPath -Arguments @("d", "-f", $ApkPath, "-o", $DecodedPath) -TimeoutSec $script:ApktoolTimeoutSec
+  if ($firstRun.timedOut) {
+    Add-Finding -Type "decompilation" -Severity "medium" -Weight 14 -Message "Timeout en decompilacion apktool ($($script:ApktoolTimeoutSec)s)."
+    return
+  }
+  if ($firstRun.exitCode -eq 0) { return }
+
+  if ($firstRun.text -match "OutOfMemoryError") {
+    $apktoolDir = Split-Path -Path $ApktoolPath -Parent
+    $apktoolJar = Join-Path $apktoolDir "apktool.jar"
+    if (Test-Path -LiteralPath $apktoolJar) {
+      $retryRun = Invoke-ProcessWithTimeout -FilePath "java" -Arguments @("-Xmx$($script:ApktoolRetryHeapMb)m", "-jar", $apktoolJar, "d", "-f", $ApkPath, "-o", $DecodedPath) -TimeoutSec $script:ApktoolTimeoutSec
+      if ($retryRun.timedOut) {
+        Add-Finding -Type "decompilation" -Severity "medium" -Weight 14 -Message "Timeout en retry decompilacion con heap ampliado ($($script:ApktoolTimeoutSec)s)."
+        return
+      }
+      if ($retryRun.exitCode -eq 0) { return }
+    }
+    Add-Finding -Type "decompilation" -Severity "medium" -Weight 12 -Message "Fallo de decompilacion por memoria (apktool). Ajustar heap Java o usar equipo con mas RAM."
+    return
+  }
+
+  Add-Finding -Type "decompilation" -Severity "medium" -Weight 10 -Message "Fallo de decompilacion con apktool. Cobertura de IOC reducida."
 }
 
 function Query-VirusTotalByHash {
@@ -126,8 +263,49 @@ if (-not (Test-Path -LiteralPath $ApkPath)) {
 }
 
 $ApkPath = (Resolve-Path -LiteralPath $ApkPath).Path
-$OutDir = (Resolve-Path -LiteralPath ".").Path + [IO.Path]::DirectorySeparatorChar + ($OutDir.TrimStart('.','\\','/'))
+$outDirCandidate = $OutDir
+if (-not [IO.Path]::IsPathRooted($OutDir)) {
+  $outDirCandidate = Join-Path (Resolve-Path -LiteralPath ".").Path ($OutDir.TrimStart('.', '\', '/'))
+}
+$OutDir = $outDirCandidate
 Ensure-Directory -Path $OutDir
+
+if ($MaxStringSamplesPerRule -lt 1) {
+  $MaxStringSamplesPerRule = 1
+}
+if ($ApktoolTimeoutSec -lt 60) {
+  $ApktoolTimeoutSec = 60
+}
+if ($MaxScanFiles -lt 1000) {
+  $MaxScanFiles = 1000
+}
+if ($ProgressEveryFiles -lt 100) {
+  $ProgressEveryFiles = 100
+}
+$profileLower = $Profile.ToLowerInvariant()
+switch ($profileLower) {
+  "fast" {
+    if ($ApktoolTimeoutSec -gt 420) { $ApktoolTimeoutSec = 420 }
+    if ($MaxScanFiles -gt 7000) { $MaxScanFiles = 7000 }
+    if ($ProgressEveryFiles -gt 500) { $ProgressEveryFiles = 500 }
+    if ($MaxStringSamplesPerRule -gt 12) { $MaxStringSamplesPerRule = 12 }
+    if ($ApktoolRetryHeapMb -gt 1536) { $ApktoolRetryHeapMb = 1536 }
+  }
+  "balanced" {
+    if ($ApktoolTimeoutSec -gt 900) { $ApktoolTimeoutSec = 900 }
+    if ($MaxScanFiles -gt 15000) { $MaxScanFiles = 15000 }
+    if ($ApktoolRetryHeapMb -gt 2048) { $ApktoolRetryHeapMb = 2048 }
+  }
+  "deep" {
+    if ($ApktoolTimeoutSec -lt 900) { $ApktoolTimeoutSec = 900 }
+    if ($MaxScanFiles -lt 25000) { $MaxScanFiles = 25000 }
+    if ($MaxStringSamplesPerRule -lt 25) { $MaxStringSamplesPerRule = 25 }
+    if ($ApktoolRetryHeapMb -lt 2560) { $ApktoolRetryHeapMb = 2560 }
+  }
+}
+$script:ApktoolRetryHeapMb = $ApktoolRetryHeapMb
+$script:ApktoolTimeoutSec = $ApktoolTimeoutSec
+Write-Phase "Perfil=$profileLower timeout=${ApktoolTimeoutSec}s maxScanFiles=$MaxScanFiles heapRetry=${ApktoolRetryHeapMb}MB"
 
 $script:Findings = New-Collection
 $script:RiskScore = 0.0
@@ -144,6 +322,7 @@ if (-not $tools.aapt) { Add-Finding -Type "tooling" -Severity "high" -Weight 35 
 if (-not $tools.apktool) { Add-Finding -Type "tooling" -Severity "high" -Weight 45 -Message "Falta apktool. Sin decompilacion para IOC." }
 
 # 1) Hash
+Write-Phase "Calculando hash"
 $hash = Get-FileHash -LiteralPath $ApkPath -Algorithm SHA256
 $sha256 = $hash.Hash
 
@@ -156,9 +335,11 @@ $signatureSummary = [PSCustomObject]@{
 }
 
 if ($tools.apksigner) {
-  $signOut = & $tools.apksigner verify --verbose --print-certs "$ApkPath" 2>&1
-  $signatureSummary.raw = @($signOut)
-  $signText = ($signOut | Out-String)
+  Write-Phase "Validando firma"
+  $signResult = Invoke-NativeCapture -FilePath $tools.apksigner -Arguments @("verify", "--verbose", "--print-certs", $ApkPath)
+  $signOut = @($signResult.output)
+  $signatureSummary.raw = $signOut
+  $signText = $signResult.text
 
   if ($signText -match "Verified using") {
     $signatureSummary.verifies = $true
@@ -183,7 +364,12 @@ $packageInfo = [PSCustomObject]@{ package = ""; versionCode = ""; versionName = 
 $permissions = @()
 
 if ($tools.aapt) {
-  $badging = & $tools.aapt dump badging "$ApkPath" 2>&1
+  Write-Phase "Extrayendo metadata y permisos"
+  $badgingResult = Invoke-NativeCapture -FilePath $tools.aapt -Arguments @("dump", "badging", $ApkPath)
+  $badging = @($badgingResult.output)
+  if ($badgingResult.exitCode -ne 0 -or $badging.Count -eq 0) {
+    Add-Finding -Type "package_info" -Severity "medium" -Weight 8 -Message "No se pudo extraer badging con aapt."
+  }
   $packageInfo = Parse-AaptPackageInfo -BadgingOutput $badging
   $permissions = Parse-AaptPermissions -BadgingOutput $badging
 
@@ -221,7 +407,11 @@ if ($tools.aapt) {
 }
 
 # 4) Decompilacion + IOC rules
-$tempRoot = Join-Path $env:TEMP ("apk_def_validator_" + [Guid]::NewGuid().ToString("N"))
+$tempBase = $env:TEMP
+if ([string]::IsNullOrWhiteSpace($tempBase)) {
+  $tempBase = [IO.Path]::GetTempPath()
+}
+$tempRoot = Join-Path $tempBase ("apk_def_validator_" + [Guid]::NewGuid().ToString("N"))
 Ensure-Directory -Path $tempRoot
 $decodedPath = Join-Path $tempRoot "decoded"
 
@@ -230,9 +420,20 @@ $suspiciousDomains = @()
 
 try {
   if ($tools.apktool) {
-    & $tools.apktool d -f "$ApkPath" -o "$decodedPath" | Out-Null
+    Write-Phase "Decompilando APK"
+    Invoke-ApktoolDecode -ApktoolPath $tools.apktool -ApkPath $ApkPath -DecodedPath $decodedPath
 
-    $scanFiles = Collect-Files -Root $decodedPath -Extensions @(".smali", ".xml", ".json", ".txt", ".html", ".js", ".kt", ".java", ".properties")
+    if (-not (Test-Path -LiteralPath $decodedPath)) {
+      Add-Finding -Type "decompilation" -Severity "medium" -Weight 10 -Message "No se pudo generar carpeta decoded para escaneo IOC."
+      $scanFiles = @()
+    }
+    else {
+      $scanFiles = Collect-Files -Root $decodedPath -Extensions @(".smali", ".xml", ".json", ".txt", ".html", ".js", ".kt", ".java", ".properties")
+      if ($scanFiles.Count -gt $MaxScanFiles) {
+        $scanFiles = @($scanFiles | Select-Object -First $MaxScanFiles)
+        Add-Finding -Type "scan_scope" -Severity "low" -Weight 4 -Message "Scan limitado a $MaxScanFiles archivos para estabilidad/performance."
+      }
+    }
 
     $rules = @(
       @{ id = "dynamic_loader"; regex = "DexClassLoader|PathClassLoader|InMemoryDexClassLoader"; severity = "high"; weight = 26; msg = "Carga dinamica de codigo detectada." },
@@ -242,11 +443,58 @@ try {
       @{ id = "exfil_channels"; regex = "api\.telegram\.org|discord(app)?\.com\/api\/webhooks|pastebin\.com|ngrok\.io|raw\.githubusercontent\.com|bit\.ly|tinyurl\.com"; severity = "high"; weight = 28; msg = "Canales de exfiltracion/C2 potenciales detectados." },
       @{ id = "crypto_weak"; regex = "AES\/ECB|DES\/ECB|MD5|SHA1"; severity = "medium"; weight = 10; msg = "Primitivas criptograficas debiles detectadas." },
       @{ id = "webview_jsbridge"; regex = "addJavascriptInterface|setJavaScriptEnabled\(true\)"; severity = "medium"; weight = 12; msg = "Superficie WebView riesgosa detectada." },
-      @{ id = "install_dropper"; regex = "REQUEST_INSTALL_PACKAGES|PackageInstaller|ACTION_INSTALL_PACKAGE|FileProvider"; severity = "high"; weight = 24; msg = "Comportamiento tipo dropper/instalador detectado." }
+      @{ id = "install_dropper"; regex = "REQUEST_INSTALL_PACKAGES|PackageInstaller|ACTION_INSTALL_PACKAGE|INSTALL_PACKAGE"; severity = "high"; weight = 24; msg = "Comportamiento tipo dropper/instalador detectado." }
     )
 
+    $domainRegex = "\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|ru|cn|top|xyz|live|shop|click|info|biz|app|dev)\b"
+    $domainMatches = New-Object System.Collections.Generic.HashSet[string]
+
+    $ruleMatchesById = @{}
     foreach ($rule in $rules) {
-      $matches = @(Get-RuleMatches -Paths $scanFiles -Pattern $rule.regex)
+      $ruleMatchesById[$rule.id] = New-Collection
+    }
+
+    $domainRegexObj = New-Object Text.RegularExpressions.Regex($domainRegex, [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    Write-Phase "Escaneando IOC en $($scanFiles.Count) archivos"
+    $processedFiles = 0
+    foreach ($f in $scanFiles) {
+      if (-not (Test-Path -LiteralPath $f)) { continue }
+
+      $patterns = @($rules.regex) + @($domainRegex)
+      $hits = Select-String -LiteralPath $f -Pattern $patterns -CaseSensitive:$false -ErrorAction SilentlyContinue
+      foreach ($h in $hits) {
+        if ($h.Pattern -eq $domainRegex) {
+          foreach ($m in $domainRegexObj.Matches($h.Line)) {
+            [void]$domainMatches.Add($m.Value.ToLowerInvariant())
+          }
+          continue
+        }
+
+        foreach ($rule in $rules) {
+          if ($rule.regex -eq $h.Pattern) {
+            $ruleMatchesById[$rule.id].Add($h) | Out-Null
+            break
+          }
+        }
+      }
+
+      $processedFiles++
+      if (($processedFiles % $ProgressEveryFiles) -eq 0) {
+        "[progress] IOC $processedFiles/$($scanFiles.Count) archivos"
+      }
+    }
+
+    foreach ($rule in $rules) {
+      $bucket = $null
+      if ($ruleMatchesById.ContainsKey($rule.id)) {
+        $bucket = $ruleMatchesById[$rule.id]
+      }
+      if ($null -eq $bucket) {
+        $matches = @()
+      }
+      else {
+        $matches = $bucket.ToArray()
+      }
       if ($matches.Count -gt 0) {
         $effectiveWeight = [Math]::Min([double]$rule.weight + ([Math]::Log10($matches.Count + 1) * 4.0), [double]$rule.weight * 1.8)
         $evidence = Select-RuleEvidence -Matches $matches -MaxItems $MaxStringSamplesPerRule
@@ -256,14 +504,6 @@ try {
     }
 
     # Dominios embebidos
-    $domainRegex = "\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|org|io|ru|cn|top|xyz|live|shop|click|info|biz|app|dev)\b"
-    $domainMatches = New-Object System.Collections.Generic.HashSet[string]
-    $domainHits = @(Get-RuleMatches -Paths $scanFiles -Pattern $domainRegex)
-    foreach ($h in $domainHits) {
-      foreach ($m in [regex]::Matches($h.Line, $domainRegex, [Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
-        [void]$domainMatches.Add($m.Value.ToLowerInvariant())
-      }
-    }
     $suspiciousTld = @($domainMatches | Where-Object { $_ -match "\.(ru|cn|top|xyz|click)$" })
     $suspiciousDomains = $suspiciousTld
     if ($suspiciousTld.Count -ge 3) {
@@ -273,12 +513,15 @@ try {
     }
 
     # Ofuscacion heuristica
-    $smaliFiles = Get-ChildItem -LiteralPath $decodedPath -Recurse -File -Filter "*.smali" -ErrorAction SilentlyContinue
+    Write-Phase "Calculando heuristica de ofuscacion"
+    $smaliFiles = @($scanFiles | Where-Object { $_.EndsWith('.smali', [System.StringComparison]::OrdinalIgnoreCase) })
     $shortClassNames = 0
     $classCount = 0
     foreach ($sf in $smaliFiles) {
+      if (-not (Test-Path -LiteralPath $sf)) { continue }
       $classCount++
-      if ($sf.BaseName -match "^[a-zA-Z]{1,2}$") { $shortClassNames++ }
+      $base = [IO.Path]::GetFileNameWithoutExtension($sf)
+      if ($base -match "^[a-zA-Z]{1,2}$") { $shortClassNames++ }
     }
     if ($classCount -gt 0) {
       $obfRatio = [Math]::Round(($shortClassNames / [double]$classCount) * 100.0, 2)
@@ -309,12 +552,16 @@ finally {
 # 5) VirusTotal hash lookup (opcional)
 $vtSummary = $null
 if ($EnableVirusTotal) {
+  Write-Phase "Consultando VirusTotal"
   if ([string]::IsNullOrWhiteSpace($VirusTotalApiKey)) {
     Add-Finding -Type "virustotal" -Severity "medium" -Weight 8 -Message "EnableVirusTotal activo pero sin API key."
   }
   else {
     try {
       $vtResp = Query-VirusTotalByHash -Sha256 $sha256 -ApiKey $VirusTotalApiKey
+      if ($null -eq $vtResp -or $null -eq $vtResp.data -or $null -eq $vtResp.data.attributes -or $null -eq $vtResp.data.attributes.last_analysis_stats) {
+        throw "Respuesta VT sin last_analysis_stats"
+      }
       $stats = $vtResp.data.attributes.last_analysis_stats
       $mal = [int]$stats.malicious
       $sus = [int]$stats.suspicious
@@ -383,35 +630,35 @@ if ($conclusions.Count -eq 0) {
   $conclusions.Add("No se detectaron señales criticas en este analisis estatico, pero no garantiza ausencia total de malware.") | Out-Null
 }
 
-$report = [PSCustomObject]@{
-  metadata = [PSCustomObject]@{
-    analyzer = "apk-definitive-validator"
-    version = "1.0.0"
-    analyzedAt = (Get-Date).ToString("s")
-    elapsedSeconds = [Math]::Round(((Get-Date) - $analysisStarted).TotalSeconds, 2)
-  }
-  input = [PSCustomObject]@{
-    apkPath = $ApkPath
-    sha256 = $sha256
-    package = $packageInfo.package
-    versionCode = $packageInfo.versionCode
-    versionName = $packageInfo.versionName
-  }
-  tooling = $tools
-  signature = $signatureSummary
-  permissions = $permissions
-  suspiciousDomains = $suspiciousDomains
-  ruleHits = $ruleHitSummary
-  virustotal = $vtSummary
-  scoring = [PSCustomObject]@{
-    riskScore = $riskRounded
-    verdict = $verdict
-    confidence = $confidence
-  }
-  findings = $Findings
-  topFindings = $topFindings
-  conclusions = @($conclusions)
+$reportMap = [ordered]@{}
+$reportMap.metadata = [PSCustomObject]@{
+  analyzer = "apk-definitive-validator"
+  version = "1.0.0"
+  analyzedAt = (Get-Date).ToString("s")
+  elapsedSeconds = [Math]::Round(((Get-Date) - $analysisStarted).TotalSeconds, 2)
 }
+$reportMap.input = [PSCustomObject]@{
+  apkPath = $ApkPath
+  sha256 = $sha256
+  package = $packageInfo.package
+  versionCode = $packageInfo.versionCode
+  versionName = $packageInfo.versionName
+}
+$reportMap.tooling = $tools
+$reportMap.signature = $signatureSummary
+$reportMap.permissions = @($permissions)
+$reportMap.suspiciousDomains = @($suspiciousDomains)
+$reportMap.ruleHits = @($ruleHitSummary)
+$reportMap.virustotal = $vtSummary
+$reportMap.scoring = [PSCustomObject]@{
+  riskScore = $riskRounded
+  verdict = $verdict
+  confidence = $confidence
+}
+$reportMap.findings = $Findings.ToArray()
+$reportMap.topFindings = @($topFindings)
+$reportMap.conclusions = $conclusions.ToArray()
+$report = [PSCustomObject]$reportMap
 
 $jsonPath = Join-Path $OutDir "report.json"
 $txtPath = Join-Path $OutDir "report.txt"
@@ -440,6 +687,7 @@ foreach ($c in $conclusions) {
 
 Set-Content -LiteralPath $txtPath -Value $lines -Encoding UTF8
 
+Write-Phase "Reporte generado"
 "Done"
 "Report JSON: $jsonPath"
 "Report TXT:  $txtPath"
